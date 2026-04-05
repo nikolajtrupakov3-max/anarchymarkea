@@ -386,17 +386,16 @@
         
         await loadUserStats();
         
-                // Загрузка диалогов о продаже (кто писал МНЕ - я продавец)
-        async function loadSalesDialogs() {
-            // Я получатель сообщений (мне пишут)
+        // НОВАЯ ФУНКЦИЯ: загрузка всех диалогов с правильным определением роли
+        async function loadAllDialogsFromSupabase() {
             const { data: messages, error } = await supabase
                 .from('messages')
                 .select('*')
-                .eq('receiver_id', user.id)
+                .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`)
                 .order('created_at', { ascending: false });
             
             if (error) {
-                console.error('Ошибка загрузки сообщений о продаже:', error);
+                console.error('Ошибка загрузки сообщений:', error);
                 return [];
             }
             
@@ -405,7 +404,8 @@
             const dialogsMap = new Map();
             
             for (const msg of messages) {
-                const key = `${msg.sender_id}_${msg.offer_id || 'no_offer'}`;
+                const key = msg.offer_id ? `offer_${msg.offer_id}` : `chat_${msg.sender_id}_${msg.receiver_id}`;
+                
                 if (!dialogsMap.has(key)) {
                     let offerName = 'Товар';
                     let offerPrice = 0;
@@ -424,25 +424,58 @@
                         } catch (err) {}
                     }
                     
-                    let senderName = msg.sender_id.substring(0, 8);
+                    const otherUserId = msg.sender_id === user.id ? msg.receiver_id : msg.sender_id;
+                    let otherUserName = otherUserId.substring(0, 8);
+                    
                     const { data: profileData } = await supabase
                         .from('profiles')
                         .select('username')
-                        .eq('id', msg.sender_id)
+                        .eq('id', otherUserId)
                         .maybeSingle();
                     
                     if (profileData?.username) {
-                        senderName = profileData.username;
+                        otherUserName = profileData.username;
+                    }
+                    
+                    // Определяем роль: я покупатель (я написал первым) или продавец (мне написали)
+                    // Находим самое первое сообщение в этом диалоге
+                    const { data: firstMsg } = await supabase
+                        .from('messages')
+                        .select('sender_id')
+                        .eq('offer_id', msg.offer_id || 0)
+                        .order('created_at', { ascending: true })
+                        .limit(1)
+                        .maybeSingle();
+                    
+                    let isBuyer = false;
+                    let isSeller = false;
+                    
+                    if (firstMsg) {
+                        // Если первое сообщение отправил я → я покупатель
+                        if (firstMsg.sender_id === user.id) {
+                            isBuyer = true;
+                            isSeller = false;
+                        } else {
+                            // Если первое сообщение отправил другой → я продавец
+                            isBuyer = false;
+                            isSeller = true;
+                        }
+                    } else {
+                        // Если не нашли первое сообщение, определяем по текущему
+                        isBuyer = (msg.sender_id === user.id);
+                        isSeller = !isBuyer;
                     }
                     
                     dialogsMap.set(key, {
-                        user_id: msg.sender_id,
-                        user_name: senderName,
+                        user_id: otherUserId,
+                        user_name: otherUserName,
                         offer_id: msg.offer_id,
                         offer_name: offerName,
                         offer_price: offerPrice,
                         last_message: msg.message,
-                        last_message_time: msg.created_at
+                        last_message_time: msg.created_at,
+                        isBuyer: isBuyer,
+                        isSeller: isSeller
                     });
                 }
             }
@@ -450,72 +483,17 @@
             return Array.from(dialogsMap.values());
         }
         
-               // Загрузка диалогов о покупке (кому я писал - я покупатель)
-        async function loadPurchasesDialogs() {
-            // Я отправитель сообщений (я пишу кому-то)
-            const { data: messages, error } = await supabase
-                .from('messages')
-                .select('*')
-                .eq('sender_id', user.id)
-                .order('created_at', { ascending: false });
+        async function loadAllDialogs() {
+            const allDialogs = await loadAllDialogsFromSupabase();
+            salesDialogs = allDialogs.filter(d => d.isSeller === true);
+            purchasesDialogs = allDialogs.filter(d => d.isBuyer === true);
             
-            if (error) {
-                console.error('Ошибка загрузки сообщений о покупке:', error);
-                return [];
-            }
-            
-            if (!messages || messages.length === 0) return [];
-            
-            const dialogsMap = new Map();
-            
-            for (const msg of messages) {
-                const key = `${msg.receiver_id}_${msg.offer_id || 'no_offer'}`;
-                if (!dialogsMap.has(key)) {
-                    let offerName = 'Товар';
-                    let offerPrice = 0;
-                    
-                    if (msg.offer_id) {
-                        try {
-                            const { data: offerData } = await supabase
-                                .from('offers')
-                                .select('name, price')
-                                .eq('id', msg.offer_id)
-                                .maybeSingle();
-                            if (offerData) {
-                                offerName = offerData.name;
-                                offerPrice = offerData.price;
-                            }
-                        } catch (err) {}
-                    }
-                    
-                    let receiverName = msg.receiver_id.substring(0, 8);
-                    const { data: profileData } = await supabase
-                        .from('profiles')
-                        .select('username')
-                        .eq('id', msg.receiver_id)
-                        .maybeSingle();
-                    
-                    if (profileData?.username) {
-                        receiverName = profileData.username;
-                    }
-                    
-                    dialogsMap.set(key, {
-                        user_id: msg.receiver_id,
-                        user_name: receiverName,
-                        offer_id: msg.offer_id,
-                        offer_name: offerName,
-                        offer_price: offerPrice,
-                        last_message: msg.message,
-                        last_message_time: msg.created_at
-                    });
-                }
-            }
-            
-            return Array.from(dialogsMap.values());
+            console.log('Все диалоги:', allDialogs);
+            console.log('Диалоги о продаже (мне пишут):', salesDialogs);
+            console.log('Диалоги о покупке (я пишу):', purchasesDialogs);
         }
         
-        // ИСПРАВЛЕННАЯ ФУНКЦИЯ УДАЛЕНИЯ (простая и надёжная)
-               async function deleteDialog(userName) {
+        async function deleteDialog(userName) {
             console.log('🗑️ deleteDialog вызван');
             console.log('userName для удаления:', userName);
             
@@ -523,7 +501,6 @@
                 return;
             }
             
-            // Вызываем SQL функцию для удаления по нику
             const { data, error } = await supabase
                 .rpc('delete_dialog_by_username', { p_username: userName });
             
@@ -535,11 +512,6 @@
                 alert('✅ Диалог удалён');
                 window.location.reload();
             }
-        }
-        
-        async function loadAllDialogs() {
-            salesDialogs = await loadSalesDialogs();
-            purchasesDialogs = await loadPurchasesDialogs();
         }
         
         function renderDialogs() {
@@ -565,7 +537,7 @@
                     </div>
                     <div class="dialog-actions">
                         <button class="dialog-reply-btn" data-user-id="${dialog.user_id}" data-user-name="${escapeHtml(dialog.user_name)}" data-offer-id="${dialog.offer_id || ''}" data-offer-name="${escapeHtml(dialog.offer_name)}" data-offer-price="${dialog.offer_price}">💬 Ответить</button>
-                       <button class="dialog-delete-btn" data-user-id="${dialog.user_id}" data-user-name="${escapeHtml(dialog.user_name)}" data-offer-id="${dialog.offer_id || '0'}">🗑️ Удалить</button>
+                        <button class="dialog-delete-btn" data-user-id="${dialog.user_id}" data-user-name="${escapeHtml(dialog.user_name)}" data-offer-id="${dialog.offer_id || '0'}">🗑️ Удалить</button>
                     </div>
                 `;
                 container.appendChild(dialogCard);
@@ -583,8 +555,8 @@
                 });
             });
             
-                     document.querySelectorAll('.dialog-delete-btn').forEach(btn => {
-                btn.addEventListener('click', async (event) => {
+            document.querySelectorAll('.dialog-delete-btn').forEach(btn => {
+                btn.addEventListener('click', async () => {
                     const userName = btn.getAttribute('data-user-name');
                     console.log('🔴 Нажата кнопка удаления');
                     console.log('userName:', userName);
@@ -679,4 +651,3 @@
     </script>
 </body>
 </html>
-async function loadPurchasesDialogs
